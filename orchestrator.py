@@ -6,6 +6,7 @@ Routes NL queries → deterministic skills → Gemini narration.
 import json
 import os
 import re
+import sqlite3
 import logging
 from typing import Optional
 from dotenv import load_dotenv
@@ -15,6 +16,7 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from skills.query_router import parse_query
@@ -28,11 +30,34 @@ logger = logging.getLogger("transitsense")
 
 app = FastAPI(title="TransitSense", version="0.1.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+
 @app.get("/")
 def serve_index():
+    frontend_index = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.exists(frontend_index):
+        return FileResponse(frontend_index)
     return FileResponse("static/index.html")
 
+assets_dir = os.path.join(FRONTEND_DIST, "assets")
+if os.path.isdir(assets_dir):
+    app.mount("/assets", StaticFiles(directory=assets_dir), name="frontend_assets")
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+favicon_path = os.path.join(FRONTEND_DIST, "favicon.svg")
+if os.path.exists(favicon_path):
+    @app.get("/favicon.svg")
+    def serve_favicon():
+        return FileResponse(favicon_path)
 
 # Simple in-memory session store for multi-turn conversations
 _sessions = {}
@@ -495,3 +520,138 @@ def _generate_solutions_text(route_id, stats):
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
+
+
+# ── Dashboard Stats Endpoints ──────────────────────────────────────
+
+def _get_db():
+    db_path = os.environ.get(
+        "TRANSITSENSE_DB",
+        os.path.join(os.path.dirname(__file__), "data", "transitsense.db"),
+    )
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.get("/stats/summary")
+def stats_summary():
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT AVG(delay_minutes) as avg_delay, COUNT(*) as total_trips "
+            "FROM trips_delays WHERE delay_minutes IS NOT NULL"
+        ).fetchone()
+        total_routes = conn.execute("SELECT COUNT(*) as cnt FROM routes").fetchone()["cnt"]
+        total_anomalies = conn.execute(
+            "SELECT COUNT(*) as cnt FROM trips_delays WHERE delay_minutes > 15 OR delay_minutes < -5"
+        ).fetchone()["cnt"]
+        ridership_row = conn.execute("SELECT SUM(ridership_count) as total FROM ridership").fetchone()
+        total_ridership = ridership_row["total"] if ridership_row and ridership_row["total"] else 0
+
+        on_time = conn.execute(
+            "SELECT COUNT(*) as cnt FROM trips_delays WHERE ABS(delay_minutes) <= 5"
+        ).fetchone()["cnt"]
+        total = conn.execute(
+            "SELECT COUNT(*) as cnt FROM trips_delays WHERE delay_minutes IS NOT NULL"
+        ).fetchone()["cnt"]
+        on_time_pct = round((on_time / total) * 100, 2) if total > 0 else 0
+
+        return {
+            "avg_delay_min": round(row["avg_delay"], 2) if row["avg_delay"] else 0,
+            "on_time_pct": on_time_pct,
+            "total_routes": total_routes,
+            "total_trips": row["total_trips"],
+            "total_anomalies": total_anomalies,
+            "total_ridership": total_ridership,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/stats/routes")
+def stats_routes():
+    scored = score_routes(("2026-06-01", "2026-06-30"), 50)
+    return scored
+
+
+@app.get("/stats/forecast/{route_id}")
+def stats_forecast(route_id: str):
+    return forecast_metric(route_id, "delay", 7)
+
+
+@app.get("/stats/zones")
+def stats_zones():
+    zones = find_zones()
+    conn = _get_db()
+    try:
+        zone_names = [z["name"] for z in zones]
+        placeholders = ",".join("?" for _ in zone_names)
+
+        delay_rows = {
+            r["zone_id"]: r
+            for r in conn.execute(
+                f"SELECT s.zone_id, AVG(td.delay_minutes) as avg_delay, COUNT(*) as row_count "
+                f"FROM trips_delays td JOIN stops s ON td.stop_id = s.stop_id "
+                f"WHERE s.zone_id IN ({placeholders}) AND td.delay_minutes IS NOT NULL "
+                f"GROUP BY s.zone_id",
+                zone_names,
+            ).fetchall()
+        }
+
+        lon_rows = {
+            r["zone_id"]: r
+            for r in conn.execute(
+                f"SELECT zone_id, stop_lon, stop_lat FROM stops "
+                f"WHERE zone_id IN ({placeholders}) AND stop_lat IS NOT NULL "
+                f"GROUP BY zone_id",
+                zone_names,
+            ).fetchall()
+        }
+
+        return [
+            {
+                "name": z["name"],
+                "route_count": z["routes"],
+                "avg_delay": round(delay_rows[z["name"]]["avg_delay"], 2) if z["name"] in delay_rows and delay_rows[z["name"]]["avg_delay"] else 0,
+                "lon": float(lon_rows[z["name"]]["stop_lon"]) if z["name"] in lon_rows and lon_rows[z["name"]]["stop_lon"] else None,
+                "lat": float(lon_rows[z["name"]]["stop_lat"]) if z["name"] in lon_rows and lon_rows[z["name"]]["stop_lat"] else None,
+            }
+            for z in zones
+        ]
+    finally:
+        conn.close()
+
+
+@app.get("/stats/anomalies")
+def stats_anomalies():
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT trip_id, delay_minutes, delay_reason, _source, date "
+            "FROM trips_delays WHERE delay_minutes > 15 OR delay_minutes < -5 "
+            "ORDER BY date DESC LIMIT 50"
+        ).fetchall()
+        return [
+            {
+                "trip_id": r["trip_id"],
+                "delay_min": r["delay_minutes"],
+                "reason": r["delay_reason"] or "unknown",
+                "source": r["_source"] or "unknown",
+                "date": r["date"],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+# SPA catch-all — must be last route, serves index.html for client-side routing
+@app.get("/{full_path:path}")
+def serve_spa(full_path: str):
+    if full_path and full_path.split("/")[0] in ("query", "health", "stats", "static", "assets"):
+        raise HTTPException(status_code=404, detail="Not found")
+    frontend_index = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.exists(frontend_index):
+        return FileResponse(frontend_index)
+    raise HTTPException(status_code=404, detail="Not found")

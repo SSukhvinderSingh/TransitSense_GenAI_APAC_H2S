@@ -185,6 +185,23 @@ def ingest_file(conn, filepath, schema_def, report):
             f"INSERT INTO {table} ({col_names}) VALUES ({placeholders})", rows
         )
     conn.commit()
+
+    INDEXES = {
+        "trips_delays": [
+            "CREATE INDEX IF NOT EXISTS idx_trips_delays_route_id ON trips_delays(route_id)",
+            "CREATE INDEX IF NOT EXISTS idx_trips_delays_date ON trips_delays(date)",
+        ],
+        "ridership": [
+            "CREATE INDEX IF NOT EXISTS idx_ridership_route_id ON ridership(route_id)",
+        ],
+        "stops": [
+            "CREATE INDEX IF NOT EXISTS idx_stops_zone_id ON stops(zone_id)",
+        ],
+    }
+    for stmt in INDEXES.get(table, []):
+        conn.execute(stmt)
+    conn.commit()
+
     report[basename]["inserted_rows"] = len(rows)
 
     if dropped:

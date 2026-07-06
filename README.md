@@ -51,3 +51,5 @@ user question → NL Query Router Skill (Gemini: parse only)
 
 ## Manual Verification
 Per project instructions, no agent commits automatically. All builds/tests are published as artifacts and marked "Awaiting Verification" in `progress.md` until a human reviewer approves.
+
+> **Note:** AI response may be rate limited due to free tier.

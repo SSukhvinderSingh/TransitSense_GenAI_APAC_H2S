@@ -23,5 +23,9 @@ ingestion_report.json
 .vscode/
 .idea/
 
-# Node (if a dashboard frontend is added later)
+# Node
 node_modules/
+frontend/dist/
+
+# Frontend env (API URL override)
+frontend/.env
